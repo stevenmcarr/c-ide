@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C Workspace</title>
+<link rel="stylesheet" href="vendor/codemirror/codemirror.min.css">
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f7f9;
+    --border: #d5d9e0;
+    --text: #1f2328;
+    --muted: #5d6673;
+    --accent: #1f6feb;
+    --accent-text: #ffffff;
+    --ok: #1a7f37;
+    --err: #c62828;
+    --warn: #9a6700;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid;
+    grid-template-rows: auto minmax(160px, 1fr) minmax(140px, 38%);
+    min-height: 420px;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header .title { font-weight: 600; margin-right: 6px; }
+  button {
+    font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: #fff; color: var(--text);
+  }
+  button:hover:not(:disabled) { border-color: #9aa3ae; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  #status { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  #editor { min-height: 0; border-bottom: 1px solid var(--border); }
+  .CodeMirror { height: 100%; font-family: var(--mono); font-size: 14px; }
+  .bottom { display: grid; grid-template-columns: minmax(150px, 30%) 1fr; min-height: 0; }
+  .pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .pane + .pane { border-left: 1px solid var(--border); }
+  .pane h2 {
+    margin: 0; padding: 4px 10px; font-size: 12px; font-weight: 600; letter-spacing: .03em;
+    text-transform: uppercase; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .pane h2 span { text-transform: none; font-weight: 400; letter-spacing: 0; }
+  #stdin, #output {
+    flex: 1; min-height: 0; margin: 0; padding: 8px 10px; border: 0; resize: none; outline: none;
+    font: 13px/1.45 var(--mono); color: var(--text); background: var(--bg); overflow: auto;
+  }
+  #output { white-space: pre-wrap; word-break: break-word; }
+  #output .err { color: var(--err); }
+  #output .warn { color: var(--warn); }
+  #output .note { color: var(--muted); font-style: italic; }
+  @media (max-width: 560px) {
+    .bottom { grid-template-columns: 1fr; grid-template-rows: 35% 1fr; }
+    .pane + .pane { border-left: 0; border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">C</span>
+  <button id="run" class="primary" disabled title="Compile and run (Ctrl+Enter)">▶ Run</button>
+  <button id="stop" disabled>■ Stop</button>
+  <button id="copy" title="Copy all of your code so you can paste it into the answer box">Copy my code</button>
+  <button id="reset" title="Replace your code with the starter code">Reset</button>
+  <span id="status">Loading compiler…</span>
+</header>
+<div id="editor"></div>
+<div class="bottom">
+  <div class="pane">
+    <h2>Input <span>(stdin, given to the program when it runs)</span></h2>
+    <textarea id="stdin" spellcheck="false" aria-label="Program input"></textarea>
+  </div>
+  <div class="pane">
+    <h2>Output</h2>
+    <pre id="output" aria-live="polite"></pre>
+  </div>
+</div>
+
+<script src="vendor/codemirror/codemirror.min.js"></script>
+<script src="vendor/codemirror/clike.min.js"></script>
+<script src="vendor/codemirror/matchbrackets.min.js"></script>
+<script src="vendor/codemirror/closebrackets.min.js"></script>
+<script>
+(() => {
+  const DEFAULT_STARTER = '#include <stdio.h>\n\nint main(void) {\n    printf("Hello, world!\\n");\n    return 0;\n}\n';
+
+  const params = new URLSearchParams(location.search);
+  const question = (params.get('q') || '').replace(/[^\w-]/g, '');
+  const timeLimit = Math.max(1, Number(params.get('timeout')) || 10) * 1000;
+  const storeKey = 'c-ide:' + (question || 'default');
+
+  const $ = (id) => document.getElementById(id);
+  const runBtn = $('run'), stopBtn = $('stop'), copyBtn = $('copy'), resetBtn = $('reset');
+  const statusEl = $('status'), outputEl = $('output'), stdinEl = $('stdin');
+
+  function store(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) {}
+  }
+  function recall(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind || '';
+  }
+
+  const editor = CodeMirror($('editor'), {
+    mode: 'text/x-csrc',
+    lineNumbers: true,
+    indentUnit: 4,
+    tabSize: 4,
+    matchBrackets: true,
+    autoCloseBrackets: true,
+    extraKeys: {
+      'Ctrl-Enter': () => run(),
+      'Cmd-Enter': () => run(),
+      Tab: (cm) => cm.somethingSelected() ? cm.indentSelection('add') : cm.replaceSelection('    '),
+      'Shift-Tab': (cm) => cm.indentSelection('subtract'),
+    },
+  });
+
+  // ---- Starter code and autosave (autosave is best-effort; storage may be blocked) ----
+  let starter = DEFAULT_STARTER, starterInput = '';
+
+  async function fetchText(url) {
+    try {
+      const r = await fetch(url, { cache: 'no-cache' });
+      return r.ok ? await r.text() : null;
+    } catch (e) { return null; }
+  }
+
+  async function loadStarter() {
+    if (question) {
+      const [code, input] = await Promise.all([
+        fetchText(`starters/${question}.c`), fetchText(`starters/${question}.in`)]);
+      if (code !== null) starter = code;
+      else appendOutput(`Note: no starter code found for "${question}".\n`, 'note');
+      if (input !== null) starterInput = input;
+    }
+    const saved = recall(storeKey);
+    const savedInput = recall(storeKey + ':stdin');
+    editor.setValue(saved !== null ? saved : starter);
+    stdinEl.value = savedInput !== null ? savedInput : starterInput;
+    editor.clearHistory();
+    editor.focus();
+  }
+
+  let saveTimer;
+  editor.on('change', () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => store(storeKey, editor.getValue()), 400);
+  });
+  stdinEl.addEventListener('input', () => store(storeKey + ':stdin', stdinEl.value));
+
+  // ---- Output rendering ----
+  let pending = '', flushQueued = false;
+  function appendOutput(text, cls) {
+    if (cls) {
+      flush();
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text;
+      outputEl.appendChild(span);
+      outputEl.scrollTop = outputEl.scrollHeight;
+      return;
+    }
+    pending += text;
+    if (!flushQueued) { flushQueued = true; requestAnimationFrame(flush); }
+  }
+  function flush() {
+    flushQueued = false;
+    if (!pending) return;
+    outputEl.appendChild(document.createTextNode(pending));
+    pending = '';
+    outputEl.scrollTop = outputEl.scrollHeight;
+  }
+  function showDiagnostics(text) {
+    for (const line of text.replace(/\n+$/, '').split('\n')) {
+      const cls = /\berror:/.test(line) ? 'err' : /\bwarning:/.test(line) ? 'warn' : '';
+      appendOutput(line + '\n', cls || undefined);
+    }
+  }
+
+  // ---- Compiler worker (long-lived) ----
+  let compiler, compilerReady = false;
+  const compileWaiters = new Map();
+  let nextId = 1;
+
+  function startCompiler() {
+    compiler = new Worker('compile-worker.js');
+    compiler.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'loaded') {
+        compilerReady = true;
+        runBtn.disabled = false;
+        setStatus('Ready');
+      } else if (m.type === 'compiled' || m.type === 'error') {
+        if (m.type === 'error' && m.id === undefined) {
+          setStatus('Compiler failed to load. Reload the page.', 'err');
+          appendOutput(m.message + '\n', 'err');
+          return;
+        }
+        const w = compileWaiters.get(m.id);
+        compileWaiters.delete(m.id);
+        if (w) w(m);
+      }
+    };
+    compiler.onerror = (e) => {
+      setStatus('Compiler failed to load. Reload the page.', 'err');
+      appendOutput(String(e.message || e) + '\n', 'err');
+    };
+    compiler.postMessage({ type: 'load' });
+  }
+
+  function compile(source) {
+    const id = nextId++;
+    return new Promise((resolve) => {
+      compileWaiters.set(id, resolve);
+      compiler.postMessage({ type: 'compile', id, source });
+    });
+  }
+
+  // ---- Running ----
+  let runner = null, runTimer = null, busy = false;
+
+  function finishRun(message, cls) {
+    clearTimeout(runTimer);
+    if (runner) { runner.terminate(); runner = null; }
+    flush();
+    if (message) {
+      const text = outputEl.textContent;
+      if (text && !text.endsWith('\n')) appendOutput('\n', 'note');
+      appendOutput(message + '\n', cls);
+    }
+    stopBtn.disabled = true;
+    runBtn.disabled = false;
+    busy = false;
+  }
+
+  async function run() {
+    if (busy || !compilerReady) return;
+    busy = true;
+    runBtn.disabled = true;
+    outputEl.textContent = '';
+    setStatus('Compiling…');
+    const result = await compile(editor.getValue());
+    if (result.type === 'error') {
+      appendOutput('Internal compiler error: ' + result.message + '\n', 'err');
+      setStatus('Compiler error', 'err');
+      busy = false; runBtn.disabled = false;
+      return;
+    }
+    if (result.diagnostics.trim()) showDiagnostics(result.diagnostics);
+    if (!result.ok) {
+      setStatus('Compile failed', 'err');
+      appendOutput('Compilation failed.\n', 'err');
+      busy = false; runBtn.disabled = false;
+      return;
+    }
+    if (result.diagnostics.trim()) appendOutput('\n');
+
+    setStatus('Running…');
+    stopBtn.disabled = false;
+    runner = new Worker('run-worker.js');
+    runner.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'output') appendOutput(m.text);
+      else if (m.type === 'exit') {
+        setStatus(m.code === 0 ? 'Finished' : `Exited with code ${m.code}`, m.code === 0 ? 'ok' : 'err');
+        finishRun(m.code === 0 ? null : `[program exited with code ${m.code}]`, m.code === 0 ? null : 'note');
+      } else if (m.type === 'error') {
+        setStatus('Runtime error', 'err');
+        finishRun(m.message, 'err');
+      }
+    };
+    runner.onerror = (e) => { setStatus('Runtime error', 'err'); finishRun(String(e.message || e), 'err'); };
+    runTimer = setTimeout(() => {
+      setStatus('Stopped', 'err');
+      finishRun(`Stopped: program ran longer than ${timeLimit / 1000} seconds (infinite loop?).`, 'err');
+    }, timeLimit);
+    runner.postMessage({ wasm: result.wasm, stdin: stdinEl.value }, [result.wasm]);
+  }
+
+  runBtn.addEventListener('click', run);
+  stopBtn.addEventListener('click', () => { setStatus('Stopped', 'err'); finishRun('Stopped.', 'note'); });
+
+  // ---- Copy / Reset ----
+  copyBtn.addEventListener('click', async () => {
+    const text = editor.getValue();
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+    if (!ok) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { ok = document.execCommand('copy'); } catch (e) {}
+      ta.remove();
+    }
+    if (ok) setStatus('Copied. Paste it into the answer box.', 'ok');
+    else { editor.focus(); editor.execCommand('selectAll'); setStatus('Code selected. Press Ctrl+C (⌘C) to copy.'); }
+  });
+
+  // Two-click confirmation (pop-up dialogs may be blocked in LockDown Browser).
+  let resetArmed = false, resetTimer;
+  resetBtn.addEventListener('click', () => {
+    if (!resetArmed) {
+      resetArmed = true;
+      resetBtn.textContent = 'Click again to erase your code';
+      resetTimer = setTimeout(() => { resetArmed = false; resetBtn.textContent = 'Reset'; }, 4000);
+      return;
+    }
+    clearTimeout(resetTimer);
+    resetArmed = false;
+    resetBtn.textContent = 'Reset';
+    editor.setValue(starter);
+    stdinEl.value = starterInput;
+    store(storeKey + ':stdin', starterInput);
+    setStatus('Starter code restored');
+  });
+
+  loadStarter();
+  startCompiler();
+})();
+</script>
+</body>
+</html>
